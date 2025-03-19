@@ -10,7 +10,7 @@ from utils import haversine_distance, format_time, format_duration, generate_col
 
 def visualize_routes(routes, warehouse_coords, orders_df):
     """
-    Visualize truck routes on a map and allow selection of a specific truck
+    Visualize truck routes on a map with enhanced interactivity and information display
 
     Args:
         routes: Dictionary of routes for each truck
@@ -31,9 +31,10 @@ def visualize_routes(routes, warehouse_coords, orders_df):
     warehouse_point = {
         'position': [warehouse_coords[1], warehouse_coords[0]],  # [lon, lat] for deck.gl
         'icon': 'warehouse',
-        'size': 30,
+        'size': 40,
         'color': [255, 0, 0],  # Red for warehouse
-        'name': 'Warehouse'
+        'name': 'Warehouse',
+        'tooltip': 'Warehouse (Main Depot)'
     }
     all_points.append(warehouse_point)
 
@@ -62,6 +63,8 @@ def visualize_routes(routes, warehouse_coords, orders_df):
             if route['end_time'] and route['start_time']:
                 work_hours = (route['end_time'] - route['start_time']).total_seconds() / 3600
                 st.write(f"**Working hours:** {format_duration(work_hours)}")
+                st.write(f"**Start time:** {format_time(route['start_time'])}")
+                st.write(f"**End time:** {format_time(route['end_time'])}")
 
     # Generate colors for each truck
     truck_colors = {}
@@ -76,7 +79,7 @@ def visualize_routes(routes, warehouse_coords, orders_df):
 
         color = truck_colors[truck_id]
         is_selected = (truck_id == selected_truck)
-        line_width = 4 if is_selected else 2
+        line_width = 5 if is_selected else 2
 
         # Start from warehouse
         path_points = []
@@ -85,7 +88,7 @@ def visualize_routes(routes, warehouse_coords, orders_df):
         path_points.append([warehouse_coords[1], warehouse_coords[0]])  # [lon, lat]
 
         # Add each waypoint
-        for waypoint in route['waypoints']:
+        for i, waypoint in enumerate(route['waypoints']):
             if waypoint['order_id'] == 'Warehouse':
                 continue  # Skip the final return to warehouse in path points
 
@@ -94,26 +97,43 @@ def visualize_routes(routes, warehouse_coords, orders_df):
             # Add to the path
             path_points.append([lon, lat])
 
-            # Add point marker
+            # Get time window information
+            if waypoint['order_id'] != 'Warehouse' and int(waypoint['order_id']) in order_details:
+                order = order_details[int(waypoint['order_id'])]
+                time_window = f"{order['Available_from'].strftime('%H:%M')}-{order['Available_to'].strftime('%H:%M')}"
+            else:
+                time_window = "N/A"
+
+            # Add point marker with enhanced tooltip
             point = {
                 'position': [lon, lat],
                 'icon': 'circle',
-                'size': 20 if is_selected else 15,
-                'color': color if is_selected else [100, 100, 100],
+                'size': 25 if is_selected else 18,
+                'color': color if is_selected else [120, 120, 120],
                 'name': f"Order {waypoint['order_id']} ({waypoint['quantity']})",
-                'tooltip': f"Order: {waypoint['order_id']}\nQuantity: {waypoint['quantity']}\nArrival: {format_time(waypoint['arrival_time'])}"
+                'truck_id': f"Truck {truck_id}",
+                'order_id': waypoint['order_id'],
+                'stop_number': i + 1,
+                'quantity': waypoint['quantity'],
+                'time_window': time_window,
+                'arrival': format_time(waypoint['arrival_time']),
+                'departure': format_time(waypoint['end_time']),
+                'tooltip': f"Truck {truck_id} - Stop #{i + 1}\nOrder: {waypoint['order_id']}\nQuantity: {waypoint['quantity']}\nTime Window: {time_window}\nArrival: {format_time(waypoint['arrival_time'])}\nDeparture: {format_time(waypoint['end_time'])}"
             }
             all_points.append(point)
 
         # Add return to warehouse
         path_points.append([warehouse_coords[1], warehouse_coords[0]])
 
-        # Create path
+        # Create path with enhanced tooltip
         path = {
             'path': path_points,
             'color': color,
             'width': line_width,
-            'truck_id': truck_id
+            'truck_id': truck_id,
+            'orders': len(route['orders']),
+            'start_time': format_time(route['start_time']),
+            'tooltip': f"Truck {truck_id}\nOrders: {len(route['orders'])}\nDistance: {route['total_distance']:.2f} km\nStart: {format_time(route['start_time'])}"
         }
         all_paths.append(path)
 
@@ -126,7 +146,8 @@ def visualize_routes(routes, warehouse_coords, orders_df):
         get_size='size',
         get_color='color',
         pickable=True,
-        size_scale=1
+        size_scale=1.5,
+        id='orders'
     )
 
     path_layer = pdk.Layer(
@@ -137,7 +158,54 @@ def visualize_routes(routes, warehouse_coords, orders_df):
         get_width='width',
         pickable=True,
         width_scale=1,
-        width_min_pixels=2
+        width_min_pixels=2,
+        id='routes'
+    )
+
+    # Add text labels for each order point
+    text_layer = pdk.Layer(
+        'TextLayer',
+        all_points,
+        get_position='position',
+        get_text='order_id',
+        get_size=16,
+        get_color=[255, 255, 255],
+        get_angle=0,
+        get_text_anchor='"middle"',
+        get_alignment_baseline='"center"',
+        pickable=True,
+        id='labels'
+    )
+
+    # Add truck identifiers along path
+    truck_labels = []
+    for path in all_paths:
+        # Add a label at the middle point of the path
+        if len(path['path']) > 2:  # At least one order point (plus warehouse at start and end)
+            middle_idx = len(path['path']) // 2
+            truck_labels.append({
+                'position': path['path'][middle_idx],
+                'text': f"Truck {path['truck_id']}",
+                'color': path['color'],
+                'truck_id': path['truck_id'],
+                'tooltip': f"Truck {path['truck_id']}\nStart: {path['start_time']}\nOrders: {path['orders']}"
+            })
+
+    truck_label_layer = pdk.Layer(
+        'TextLayer',
+        truck_labels,
+        get_position='position',
+        get_text='text',
+        get_size=18,
+        get_color='color',
+        get_angle=0,
+        get_text_anchor='"middle"',
+        get_alignment_baseline='"center"',
+        get_background=True,
+        get_background_color=[0, 0, 0, 150],
+        background_padding=[5, 3],
+        pickable=True,
+        id='truck_labels'
     )
 
     # Set the initial view state
@@ -148,12 +216,16 @@ def visualize_routes(routes, warehouse_coords, orders_df):
         pitch=0
     )
 
-    # Create the deck
+    # Create the deck with all layers
     deck = pdk.Deck(
-        layers=[path_layer, icon_layer],
+        layers=[path_layer, icon_layer, text_layer, truck_label_layer],
         initial_view_state=view_state,
         tooltip={
-            'text': '{name}'
+            'html': '<div><b>{tooltip}</b></div>',
+            'style': {
+                'backgroundColor': 'steelblue',
+                'color': 'white'
+            }
         },
         map_style='mapbox://styles/mapbox/light-v10'
     )
@@ -161,6 +233,23 @@ def visualize_routes(routes, warehouse_coords, orders_df):
     # Display the map
     with col2:
         st.pydeck_chart(deck)
+
+    # Add click handler for truck selection
+    st.markdown("""
+    <style>
+    .map-click-info {
+        background-color: #f0f2f6;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    with col2:
+        st.markdown(
+            "<div class='map-click-info'>👆 Click on any truck route or order on the map to select that truck</div>",
+            unsafe_allow_html=True)
 
     return selected_truck
 

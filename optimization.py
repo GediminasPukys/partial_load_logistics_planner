@@ -272,7 +272,9 @@ def optimize_routes(df, fleet_params):
 def calculate_optimal_start_times(orders, default_start_times, warehouse_coords,
                                   avg_speed, load_unload_hours, workday_length, current_date):
     """
-    Calculate optimal start times for trucks based on order time windows
+    Calculate optimal start times for trucks based on order time windows,
+    ensuring complete coverage of early morning and late night time windows
+    while minimizing travel distance.
 
     Args:
         orders: DataFrame of orders
@@ -286,6 +288,12 @@ def calculate_optimal_start_times(orders, default_start_times, warehouse_coords,
     Returns:
         Dictionary of optimized start times by truck ID
     """
+    from datetime import datetime, timedelta, time
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+    from utils import haversine_distance, travel_time
+
     # Create a list of existing truck IDs
     truck_ids = list(default_start_times.keys())
     optimized_start_times = {}
@@ -294,7 +302,7 @@ def calculate_optimal_start_times(orders, default_start_times, warehouse_coords,
     if len(orders) == 0:
         return default_start_times
 
-    # Calculate min travel time from warehouse to any order
+    # Calculate travel time from warehouse to each order
     warehouse_lat, warehouse_lon = warehouse_coords
 
     # Add travel time information to orders
@@ -306,105 +314,323 @@ def calculate_optimal_start_times(orders, default_start_times, warehouse_coords,
         axis=1
     )
 
-    # Make working copies with simplified time information for clustering
-    orders_for_clustering = orders.copy()
+    # Add distance from warehouse for clustering and proximity analysis
+    orders['distance_from_warehouse'] = orders.apply(
+        lambda row: haversine_distance(warehouse_lat, warehouse_lon, row['Latitude'], row['Longitude']),
+        axis=1
+    )
+
+    # Create a working copy for time calculations
+    orders_for_analysis = orders.copy()
 
     # Add a column to convert datetime to a float representing hours since midnight
-    # This is a better approach for clustering than just extracting hour components
     def datetime_to_hours(dt):
         return dt.hour + dt.minute / 60 + dt.second / 3600
 
     # Extract hours from datetime for easier calculations
-    orders_for_clustering['from_hour'] = orders['Available_from'].apply(datetime_to_hours)
-    orders_for_clustering['to_hour'] = orders['Available_to'].apply(datetime_to_hours)
+    orders_for_analysis['from_hour'] = orders['Available_from'].apply(datetime_to_hours)
+    orders_for_analysis['to_hour'] = orders['Available_to'].apply(datetime_to_hours)
 
-    # Handle overnight windows by adding 24 to the to_hour if it crosses midnight
-    # We detect overnight by checking if the end date is later than the start date
+    # Handle overnight windows
     overnight_mask = orders['Available_to'].dt.date > orders['Available_from'].dt.date
 
-    # If it's overnight and to_hour < from_hour, add 24 hours
-    # This ensures overnight windows are represented as a continuous time range
-    adjust_mask = overnight_mask & (orders_for_clustering['to_hour'] < orders_for_clustering['from_hour'])
-    orders_for_clustering.loc[adjust_mask, 'to_hour'] += 24
+    # For overnight windows, add 24 hours to the to_hour
+    orders_for_analysis.loc[overnight_mask, 'to_hour'] += 24
 
-    # Create clusters of orders with similar time windows
-    clusters = []
-    remaining_orders = orders_for_clustering.copy()
+    # Create forced time brackets to ensure complete 24-hour coverage
+    time_brackets = [
+        {'name': 'Very Early Morning', 'start': 0, 'end': 5, 'min_trucks': 1},
+        {'name': 'Early Morning', 'start': 5, 'end': 8, 'min_trucks': 1},
+        {'name': 'Morning', 'start': 8, 'end': 11, 'min_trucks': 0},
+        {'name': 'Midday', 'start': 11, 'end': 14, 'min_trucks': 0},
+        {'name': 'Afternoon', 'start': 14, 'end': 17, 'min_trucks': 0},
+        {'name': 'Evening', 'start': 17, 'end': 20, 'min_trucks': 1},
+        {'name': 'Night', 'start': 20, 'end': 24, 'min_trucks': 1}
+    ]
 
-    # Simple clustering based on time windows
-    while len(remaining_orders) > 0:
-        # Take the order with earliest deadline as cluster seed
-        seed_order = remaining_orders.sort_values('to_hour').iloc[0]
-        cluster_window_start = seed_order['from_hour']
-        cluster_window_end = seed_order['to_hour']
-
-        # Find all orders that can be serviced in a similar time window
-        # The logic here allows for more flexible clustering with some overlap
-        cluster_orders = remaining_orders[
-            (remaining_orders['from_hour'] < cluster_window_end + 1) &
-            (remaining_orders['to_hour'] > cluster_window_start - 1)
+    # Identify orders that fall primarily or exclusively in each time bracket
+    for bracket in time_brackets:
+        # Find orders where a significant portion of their time window falls in this bracket
+        bracket_orders = orders_for_analysis[
+            # Orders that start in this bracket
+            ((orders_for_analysis['from_hour'] >= bracket['start']) &
+             (orders_for_analysis['from_hour'] < bracket['end'])) |
+            # Orders that end in this bracket
+            ((orders_for_analysis['to_hour'] > bracket['start']) &
+             (orders_for_analysis['to_hour'] <= bracket['end'])) |
+            # Orders that completely contain this bracket
+            ((orders_for_analysis['from_hour'] <= bracket['start']) &
+             (orders_for_analysis['to_hour'] >= bracket['end']))
             ]
 
-        if len(cluster_orders) > 0:
-            clusters.append(cluster_orders)
-            # Remove these orders from consideration
-            remaining_orders = remaining_orders[~remaining_orders.index.isin(cluster_orders.index)]
+        # Find orders exclusive to this bracket (or largely confined to it)
+        exclusive_orders = bracket_orders[
+            # Window is less than 6 hours (not spanning multiple brackets)
+            (bracket_orders['to_hour'] - bracket_orders['from_hour'] < 6) &
+            # At least half the window is in this bracket
+            (((bracket_orders['to_hour'].clip(upper=bracket['end']) -
+               bracket_orders['from_hour'].clip(lower=bracket['start'])) /
+              (bracket_orders['to_hour'] - bracket_orders['from_hour'])) >= 0.5)
+            ]
+
+        # Store the counts in the bracket dict
+        bracket['total_orders'] = len(bracket_orders)
+        bracket['exclusive_orders'] = len(exclusive_orders)
+        bracket['orders_list'] = bracket_orders
+        bracket['exclusive_list'] = exclusive_orders
+
+    # Display time bracket analysis
+    st.text("Analyzing order distribution across time brackets...")
+
+    for bracket in time_brackets:
+        st.text(f"{bracket['name']} ({bracket['start']:02d}:00-{bracket['end']:02d}:00): " +
+                f"{bracket['total_orders']} orders, {bracket['exclusive_orders']} exclusive")
+
+    # Determine how many trucks to allocate to each bracket
+    total_trucks = len(truck_ids)
+    unallocated_trucks = total_trucks
+
+    # First, allocate minimum required trucks to each bracket
+    for bracket in time_brackets:
+        bracket['allocated_trucks'] = bracket['min_trucks']
+        unallocated_trucks -= bracket['min_trucks']
+
+    # Then allocate remaining trucks proportionally based on exclusive order counts
+    if unallocated_trucks > 0:
+        total_exclusive_orders = sum(b['exclusive_orders'] for b in time_brackets)
+
+        if total_exclusive_orders > 0:
+            for bracket in time_brackets:
+                # Calculate proportional allocation
+                proportion = bracket['exclusive_orders'] / total_exclusive_orders
+                additional_trucks = max(0, round(proportion * unallocated_trucks))
+                bracket['allocated_trucks'] += additional_trucks
+
+            # Check if we've allocated all trucks
+            allocated_total = sum(b['allocated_trucks'] for b in time_brackets)
+
+            # If we have any leftover, allocate to brackets with the most total orders
+            if allocated_total < total_trucks:
+                remaining = total_trucks - allocated_total
+                sorted_brackets = sorted(time_brackets, key=lambda x: x['total_orders'], reverse=True)
+
+                for i in range(remaining):
+                    sorted_brackets[i % len(sorted_brackets)]['allocated_trucks'] += 1
         else:
-            # Safety exit if no orders match criteria
-            break
+            # If no exclusive orders, distribute evenly
+            for i, bracket in enumerate(time_brackets):
+                if i < unallocated_trucks:
+                    bracket['allocated_trucks'] += 1
 
-    # Now determine optimal start times for each cluster
-    for i, truck_id in enumerate(truck_ids):
-        if i < len(clusters):
-            # Get the cluster this truck will handle
-            cluster = clusters[i]
+    # Optimize start times within each bracket
+    assigned_truck_count = 0
 
-            # Find earliest order in the cluster
-            earliest_order = cluster.sort_values('from_hour').iloc[0]
+    for bracket in time_brackets:
+        if bracket['allocated_trucks'] == 0:
+            continue
 
-            # Calculate when truck needs to leave warehouse to reach the earliest order just in time
-            # Subtract travel time from the order's start window
-            earliest_start_hour = earliest_order['from_hour'] - earliest_order['travel_time_from_warehouse']
+        # Get orders for this bracket
+        bracket_orders = bracket['orders_list']
 
-            # Add some buffer (15 min)
-            earliest_start_hour = max(5, earliest_start_hour - 0.25)  # No earlier than 5 AM
+        if len(bracket_orders) == 0:
+            # Skip if no orders in this bracket
+            continue
 
-            # Handle hours > 24 properly
-            if earliest_start_hour >= 24:
-                earliest_start_hour = earliest_start_hour % 24
+        # For brackets with few orders, check geographic clustering
+        if len(bracket_orders) <= bracket['allocated_trucks'] * 3:
+            # Sort by distance to create geographically proximate assignments
+            bracket_orders = bracket_orders.sort_values('distance_from_warehouse')
 
-            # Convert to time object
-            hour = int(earliest_start_hour)
-            minute = int((earliest_start_hour - hour) * 60)
+            # Divide orders into clusters based on allocated trucks
+            clusters = []
+            cluster_size = max(1, len(bracket_orders) // bracket['allocated_trucks'])
 
-            # Create the time object
-            optimized_start_time = time(hour, minute)
+            for i in range(bracket['allocated_trucks']):
+                start_idx = i * cluster_size
+                end_idx = (i + 1) * cluster_size if i < bracket['allocated_trucks'] - 1 else len(bracket_orders)
+                if start_idx < len(bracket_orders):
+                    clusters.append(bracket_orders.iloc[start_idx:end_idx])
+                else:
+                    # Empty cluster if we've run out of orders
+                    clusters.append(pd.DataFrame())
 
-            # Store in our dictionary
-            optimized_start_times[truck_id] = optimized_start_time
+            # For each cluster, find the best start time
+            for cluster_idx, cluster in enumerate(clusters):
+                if len(cluster) == 0:
+                    # Use the middle of the bracket for empty clusters
+                    best_hour = (bracket['start'] + bracket['end']) / 2
+                else:
+                    # Find the best start time for this cluster
+                    best_hour = find_best_start_time(
+                        cluster, bracket['start'], bracket['end'],
+                        avg_speed, load_unload_hours, workday_length, 0.5
+                    )
+
+                # Convert to time object
+                hour = int(best_hour)
+                minute = int((best_hour - hour) * 60)
+
+                # Assign to next available truck ID
+                if assigned_truck_count < total_trucks:
+                    truck_id = truck_ids[assigned_truck_count]
+                    optimized_start_times[truck_id] = time(hour, minute)
+                    assigned_truck_count += 1
         else:
-            # Use default start time for extra trucks
+            # For brackets with many orders, use more sophisticated clustering
+
+            # Try to identify clusters with similar geographic locations
+            from sklearn.cluster import KMeans
+
+            # Prepare coordinates for clustering
+            coords = bracket_orders[['Latitude', 'Longitude']].values
+
+            # Determine number of clusters (use allocated trucks or fewer if not many orders)
+            n_clusters = min(bracket['allocated_trucks'], max(1, len(bracket_orders) // 5))
+
+            if len(coords) >= n_clusters:
+                # Use K-means to create geographic clusters
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+                bracket_orders['cluster'] = kmeans.fit_predict(coords)
+
+                # Process each geographic cluster
+                for i in range(n_clusters):
+                    cluster = bracket_orders[bracket_orders['cluster'] == i]
+
+                    if len(cluster) > 0:
+                        # Find the best start time for this cluster
+                        best_hour = find_best_start_time(
+                            cluster, bracket['start'], bracket['end'],
+                            avg_speed, load_unload_hours, workday_length, 0.5
+                        )
+
+                        # Convert to time object
+                        hour = int(best_hour)
+                        minute = int((best_hour - hour) * 60)
+
+                        # Assign to next available truck ID
+                        if assigned_truck_count < total_trucks:
+                            truck_id = truck_ids[assigned_truck_count]
+                            optimized_start_times[truck_id] = time(hour, minute)
+                            assigned_truck_count += 1
+            else:
+                # Not enough orders for clustering, use simpler approach
+                best_hour = (bracket['start'] + bracket['end']) / 2
+
+                # Assign trucks allocated to this bracket
+                for i in range(bracket['allocated_trucks']):
+                    if assigned_truck_count < total_trucks:
+                        truck_id = truck_ids[assigned_truck_count]
+
+                        # Stagger start times slightly within the bracket
+                        hour_offset = i * 0.5  # 30 minute intervals
+                        adjusted_hour = min(bracket['end'] - 0.5, best_hour + hour_offset)
+
+                        hour = int(adjusted_hour)
+                        minute = int((adjusted_hour - hour) * 60)
+
+                        optimized_start_times[truck_id] = time(hour, minute)
+                        assigned_truck_count += 1
+
+    # Ensure all trucks have been assigned
+    if assigned_truck_count < total_trucks:
+        # Distribute remaining trucks across time brackets that need more coverage
+        sorted_brackets = sorted(time_brackets,
+                                 key=lambda x: x['total_orders'] / (
+                                     x['allocated_trucks'] if x['allocated_trucks'] > 0 else 1),
+                                 reverse=True)
+
+        for bracket in sorted_brackets:
+            if assigned_truck_count >= total_trucks:
+                break
+
+            # Assign an additional truck to this high-demand bracket
+            best_hour = (bracket['start'] + bracket['end']) / 2
+            hour = int(best_hour)
+            minute = int((best_hour - hour) * 60)
+
+            truck_id = truck_ids[assigned_truck_count]
+            optimized_start_times[truck_id] = time(hour, minute)
+            assigned_truck_count += 1
+
+    # Ensure every truck has a start time
+    for truck_id in truck_ids:
+        if truck_id not in optimized_start_times:
             optimized_start_times[truck_id] = default_start_times[truck_id]
 
-    # If there are more trucks than clusters, distribute them with staggered start times
-    if len(truck_ids) > len(clusters):
-        # Calculate average start time of assigned trucks
-        assigned_times = [optimized_start_times[truck_id] for truck_id in truck_ids[:len(clusters)]]
+    # Log the final truck allocations
+    bracket_allocations = {b['name']: 0 for b in time_brackets}
+    for truck_id, start_time in optimized_start_times.items():
+        hour = start_time.hour + start_time.minute / 60
+        for bracket in time_brackets:
+            if bracket['start'] <= hour < bracket['end']:
+                bracket_allocations[bracket['name']] += 1
+                break
 
-        if assigned_times:
-            # Calculate average start hour
-            avg_hour = sum(t.hour + t.minute / 60 for t in assigned_times) / len(assigned_times)
-
-            # For remaining trucks, distribute around the average with 30 min intervals
-            for i, truck_id in enumerate(truck_ids[len(clusters):]):
-                offset = (i % 4) * 0.5  # 0, 0.5, 1, 1.5 hours offset
-                new_hour = avg_hour + offset
-                hour = int(new_hour) % 24  # Keep hour within valid range
-                minute = int((new_hour - int(new_hour)) * 60)
-                optimized_start_times[truck_id] = time(hour, minute)
+    # Display the final allocation
+    st.info("Optimized truck start time distribution:")
+    for bracket_name, count in bracket_allocations.items():
+        st.text(f"  {bracket_name}: {count} trucks")
 
     return optimized_start_times
 
+
+def find_best_start_time(orders_df, min_hour, max_hour, avg_speed, load_unload_hours, workday_length, step=0.5):
+    """
+    Find the best start time for a given set of orders within a specified time range.
+
+    Args:
+        orders_df: DataFrame containing orders
+        min_hour: Minimum hour to consider
+        max_hour: Maximum hour to consider
+        avg_speed: Average speed in km/h
+        load_unload_hours: Time for loading/unloading in hours
+        workday_length: Maximum work day length in hours
+        step: Time increment to test (in hours)
+
+    Returns:
+        best_hour: The best starting hour (float)
+    """
+    # Test different start times within the range
+    test_hours = np.arange(min_hour, max_hour, step)
+
+    best_hour = (min_hour + max_hour) / 2  # Default to middle of range
+    best_score = -1
+
+    for hour in test_hours:
+        # Evaluate how many orders can be reached with this start time
+        reachable_orders = 0
+        total_distance = 0
+
+        for _, order in orders_df.iterrows():
+            # Calculate when we would arrive at this order
+            arrival_hour = hour + order['travel_time_from_warehouse']
+
+            # Check if we arrive within the time window
+            if arrival_hour <= order['to_hour']:
+                # If we arrive too early, we can wait until the window opens
+                effective_arrival = max(arrival_hour, order['from_hour'])
+
+                # Check if we can finish service and return within workday length
+                service_end = effective_arrival + load_unload_hours
+                return_travel = order['travel_time_from_warehouse']
+                total_time = service_end + return_travel - hour
+
+                if total_time <= workday_length:
+                    reachable_orders += 1
+                    total_distance += 2 * order['distance_from_warehouse']  # Out and back
+
+        # Calculate score - prioritize coverage but consider distance
+        if reachable_orders > 0:
+            # Score formula emphasizes order coverage but includes distance efficiency
+            coverage_score = reachable_orders / len(orders_df) * 100
+            distance_score = 100 - (total_distance / (reachable_orders * 100))
+            score = (coverage_score * 0.8) + (distance_score * 0.2)
+
+            if score > best_score:
+                best_score = score
+                best_hour = hour
+
+    return best_hour
 
 def check_insertion_feasibility(truck_route, position, order, warehouse_coords, avg_speed, load_unload_hours,
                                 workday_length, order_windows=None):
