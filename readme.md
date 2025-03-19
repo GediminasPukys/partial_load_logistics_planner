@@ -45,11 +45,12 @@ id,Available_from,Available_to,quantity,Latitude,Longitude
 ## Optimization Approach
 
 The application uses a greedy insertion algorithm that:
-1. Sorts orders by earliest deadline and quantity
-2. For each order, finds the best truck and insertion position
-3. Respects all constraints (capacity, time windows, working hours)
-4. Minimizes additional distance required for each insertion
-5. Returns all trucks to the warehouse at the end of their routes
+1. Sorts orders by earliest deadline and distance from warehouse to cluster geographically proximate orders
+2. Prioritizes filling existing trucks before using new ones
+3. For each order, finds the best truck and insertion position that minimizes additional distance
+4. Respects all constraints (capacity, time windows, working hours)
+5. Accepts excellent fits immediately to improve overall distance optimization
+6. Returns all trucks to the warehouse at the end of their routes
 
 ## File Structure
 
